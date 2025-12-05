@@ -1,11 +1,4 @@
 requests==2.32.3
-torch==2.1.0
-transformers==4.35.0
-# Core HTTP + utilities
-requests
 psutil
-
-# System tray + icon support (Windows-friendly)
 pystray
 Pillow
-
