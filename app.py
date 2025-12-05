@@ -60,11 +60,11 @@ if AGENT_LABELS_RAW.strip():
 BASE_LABELS["worker_profile"] = WORKER_PROFILE
 
 CAPABILITIES: Dict[str, Any] = {
-    # Lite agent: cheap text ops only
-    "ops": ["map_tokenize", "map_classify"],
+    # Lite agent: cheap text ops only + routing
+    "ops": ["map_tokenize", "map_classify", "map_route"],
 }
 
-# ---------------- ops: tokenize + lightweight classify ----------------
+# ---------------- ops: tokenize + lightweight classify + route ----------------
 
 
 def op_map_tokenize(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -162,9 +162,77 @@ def op_map_classify(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def op_map_route(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Routing helper op for agent-lite.
+
+    Uses local limits from WORKER_PROFILE to decide how this
+    payload *should* be handled:
+
+      - "local"  : safe for ultra-lite agent
+      - "heavy"  : should be pushed to server/GPU tier
+      - "discard": empty or obviously useless payload
+
+    This doesn't actually move work; it returns *hints* the controller
+    can use to schedule the real follow-up task.
+    """
+    limits = WORKER_PROFILE.get("limits", {}) or {}
+    max_bytes = limits.get("max_payload_bytes")
+    max_tokens = limits.get("max_tokens")
+
+    text = str(payload.get("text", "") or "")
+    explicit_bytes = payload.get("payload_bytes")
+    explicit_tokens = payload.get("tokens")
+
+    if not text and explicit_bytes is None and explicit_tokens is None:
+        return {
+            "ok": True,
+            "route": "discard",
+            "reason": "empty_payload",
+        }
+
+    # Approximate size
+    approx_bytes = explicit_bytes
+    if approx_bytes is None:
+        try:
+            approx_bytes = len(text.encode("utf-8"))
+        except Exception:
+            approx_bytes = len(text)
+
+    approx_tokens = explicit_tokens
+    if approx_tokens is None:
+        approx_tokens = len(text.split()) if text else 0
+
+    exceeds_bytes = bool(max_bytes is not None and approx_bytes is not None and approx_bytes > max_bytes)
+    exceeds_tokens = bool(max_tokens is not None and approx_tokens is not None and approx_tokens > max_tokens)
+
+    if exceeds_bytes or exceeds_tokens:
+        route = "heavy"
+        suggested_tier = "server-or-gpu"
+        reason = "exceeds_ultra_lite_limits"
+    else:
+        route = "local"
+        suggested_tier = WORKER_PROFILE.get("tier", "ultra-lite")
+        reason = "within_ultra_lite_limits"
+
+    return {
+        "ok": True,
+        "route": route,
+        "suggested_tier": suggested_tier,
+        "reason": reason,
+        "estimated_payload_bytes": approx_bytes,
+        "estimated_tokens": approx_tokens,
+        "limits": {
+            "max_payload_bytes": max_bytes,
+            "max_tokens": max_tokens,
+        },
+    }
+
+
 OPS = {
     "map_tokenize": op_map_tokenize,
     "map_classify": op_map_classify,
+    "map_route": op_map_route,
 }
 
 # ---------------- metrics helpers ----------------
