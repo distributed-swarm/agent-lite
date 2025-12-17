@@ -285,6 +285,17 @@ def worker_loop():
         task = _get_json("/task", {"agent": AGENT_NAME, "wait_ms": TASK_WAIT_MS})
         if not task: continue
 
+        # HARD ADMISSION CONTROL (agent-lite law)
+        # If system state changed while waiting, refuse immediately
+        if not system_allows_work():
+            _post_json("/result", {
+                "id": task["id"],
+                "agent": AGENT_NAME,
+                "ok": False,
+                "error": "agent_busy_or_user_active"
+            })
+            continue
+            
         op = task.get("op")
         payload = task.get("payload") or {}
         
