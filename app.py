@@ -4,7 +4,7 @@ import socket
 import signal
 import threading
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Dict, Any, List, Optional
 
 import requests
 
@@ -13,48 +13,32 @@ try:
 except ImportError:
     psutil = None
 
-# =========================
-#   ADMIN / SERVICE LOGGING
-# =========================
-
 PROGRAM_DATA_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "AgentLite"
 PROGRAM_DATA_DIR.mkdir(parents=True, exist_ok=True)
 AGENT_LOG_FILE = PROGRAM_DATA_DIR / "agent.log"
 
 _log_lock = threading.Lock()
 
-def log(msg: str):
+def log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{ts} [agent] {msg}\n"
     with _log_lock:
-        AGENT_LOG_FILE.open("a", encoding="utf-8").write(line)
-
-# =========================
-#   CONFIG (NO PROMPTS)
-# =========================
+        AGENT_LOG_FILE.open("a", encoding="utf-8").write(f"{ts} [agent-lite] {msg}\n")
 
 CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080").rstrip("/")
 AGENT_NAME = os.getenv("AGENT_NAME", socket.gethostname())
-AGENT_TYPE = os.getenv("AGENT_TYPE", "lite")
-AGENT_VERSION = os.getenv("AGENT_VERSION", "lite")
-HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "5"))
-HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "3"))
 
-# Lite guardrails
-BUSY_CPU_THRESHOLD = float(os.getenv("BUSY_CPU_THRESHOLD", "75"))  # percent
+BUSY_CPU_THRESHOLD = float(os.getenv("BUSY_CPU_THRESHOLD", "75"))
 DISABLE_ON_BATTERY = os.getenv("DISABLE_ON_BATTERY", "0").strip().lower() in ("1", "true", "yes")
 
-# Tokenize/chunk config
+HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "5"))
+POLL_IDLE_SEC = float(os.getenv("POLL_IDLE_SEC", "0.05"))
+HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "3"))
+
 CHUNK_BYTES = int(os.getenv("CHUNK_BYTES", "2048"))
-
-# Cache-ish size classes
-L2_TARGET_BYTES = int(os.getenv("L2_TARGET_BYTES", str(256 * 1024)))       # 256KB
-L3_TARGET_BYTES = int(os.getenv("L3_TARGET_BYTES", str(8 * 1024 * 1024)))  # 8MB
-
-SAFE_MAX_BYTES = int(os.getenv("SAFE_MAX_BYTES", str(2 * 1024 * 1024)))    # 2MB soft
-HARD_MAX_BYTES = int(os.getenv("HARD_MAX_BYTES", str(8 * 1024 * 1024)))    # 8MB hard (route to heavy)
-
-AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "")
+L2_TARGET_BYTES = int(os.getenv("L2_TARGET_BYTES", str(256 * 1024)))
+L3_TARGET_BYTES = int(os.getenv("L3_TARGET_BYTES", str(8 * 1024 * 1024)))
+SAFE_MAX_BYTES = int(os.getenv("SAFE_MAX_BYTES", str(2 * 1024 * 1024)))
+HARD_MAX_BYTES = int(os.getenv("HARD_MAX_BYTES", str(8 * 1024 * 1024)))
 
 WORKER_PROFILE: Dict[str, Any] = {
     "profile": "lite",
@@ -66,35 +50,13 @@ WORKER_PROFILE: Dict[str, Any] = {
     },
 }
 
-CONFIG: Dict[str, Any] = {
-    "agent_type": AGENT_TYPE,
-    "version": AGENT_VERSION,
-}
+CAPABILITIES: Dict[str, Any] = {"cpu": True, "gpu": False}
 
-CAPABILITIES: Dict[str, Any] = {
-    "cpu": True,
-    "gpu": False,
-    "disk_io": False,
-    "net_io": True,
-}
-
-BASE_LABELS: Dict[str, Any] = {
-    "agent_type": CONFIG["agent_type"],
-    "version": CONFIG["version"],
+LABELS: Dict[str, Any] = {
+    "agent_type": "lite",
+    "version": "lite",
     "worker_profile": WORKER_PROFILE,
 }
-
-if AGENT_LABELS_RAW.strip():
-    for item in AGENT_LABELS_RAW.split(","):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            BASE_LABELS[k.strip()] = v.strip()
-        else:
-            BASE_LABELS[item.strip()] = True
-
-# =========================
-#   OPS IMPLEMENTATIONS
-# =========================
 
 def op_echo(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "echo": payload}
@@ -102,224 +64,84 @@ def op_echo(payload: Dict[str, Any]) -> Dict[str, Any]:
 def op_map_tokenize(payload: Dict[str, Any]) -> Dict[str, Any]:
     text = str(payload.get("text", ""))
     tokens = text.split()
-
     encoded = text.encode("utf-8", errors="ignore")
     chunks: List[str] = []
     for i in range(0, len(encoded), CHUNK_BYTES):
-        chunk_bytes = encoded[i : i + CHUNK_BYTES]
-        chunks.append(chunk_bytes.decode("utf-8", errors="ignore"))
-
-    return {
-        "ok": True,
-        "tokens": tokens,
-        "length": len(tokens),
-        "chunks": chunks,
-        "chunk_bytes": CHUNK_BYTES,
-        "total_bytes": len(encoded),
-        "num_chunks": len(chunks),
-    }
-
-_POSITIVE_WORDS = {"good", "great", "excellent", "awesome", "love", "like"}
-_NEGATIVE_WORDS = {"bad", "terrible", "awful", "hate", "dislike"}
-
-def op_map_classify(payload: Dict[str, Any]) -> Dict[str, Any]:
-    text = str(payload.get("text", "")).strip()
-    if not text:
-        return {"ok": True, "label": "NEUTRAL", "score": 0.0}
-
-    tokens = [t.strip(".,!?;:").lower() for t in text.split() if t.strip()]
-    pos_hits = sum(1 for t in tokens if t in _POSITIVE_WORDS)
-    neg_hits = sum(1 for t in tokens if t in _NEGATIVE_WORDS)
-
-    if pos_hits > neg_hits:
-        label = "POSITIVE"
-    elif neg_hits > pos_hits:
-        label = "NEGATIVE"
-    else:
-        label = "NEUTRAL"
-
-    score = float(pos_hits - neg_hits)
-    return {"ok": True, "label": label, "score": score, "pos_hits": pos_hits, "neg_hits": neg_hits}
-
-def op_map_route(payload: Dict[str, Any]) -> Dict[str, Any]:
-    limits = WORKER_PROFILE.get("limits", {})
-    max_bytes = int(limits.get("max_payload_bytes", SAFE_MAX_BYTES))
-
-    text = str(payload.get("text", "") or "")
-    approx_bytes = int(payload.get("payload_bytes") or len(text.encode("utf-8")))
-
-    if approx_bytes <= L2_TARGET_BYTES:
-        size_class = "l2"
-    elif approx_bytes <= L3_TARGET_BYTES:
-        size_class = "l3"
-    else:
-        size_class = "ram"
-
-    if approx_bytes > HARD_MAX_BYTES:
-        return {"ok": True, "route": "heavy", "reason": "exceeds_hard_limit"}
-    elif approx_bytes > max_bytes and size_class == "ram":
-        return {"ok": True, "route": "heavy", "reason": "exceeds_soft_cpu_limit"}
-
-    return {"ok": True, "route": f"local_{size_class}", "reason": "within_cpu_limits"}
+        chunks.append(encoded[i:i+CHUNK_BYTES].decode("utf-8", errors="ignore"))
+    return {"ok": True, "tokens": tokens, "length": len(tokens), "chunks": chunks}
 
 def op_fibonacci(payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        n = int(payload.get("n", 0))
-    except Exception:
-        return {"ok": False, "error": "invalid_n"}
-
-    if n < 0:
-        return {"ok": False, "error": "n_must_be_nonnegative"}
-    if n > 200000:
-        return {"ok": False, "error": "n_too_large_for_lite"}
-
+    n = int(payload.get("n", 0))
+    if n < 0 or n > 200000:
+        return {"ok": False, "error": "n_out_of_range_for_lite"}
     a, b = 0, 1
     for _ in range(n):
         a, b = b, a + b
     return {"ok": True, "n": n, "value": a}
 
 def op_prime_factor(payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        n = int(payload.get("n", 0))
-    except Exception:
-        return {"ok": False, "error": "invalid_n"}
-
+    n = int(payload.get("n", 0))
     if n <= 1:
         return {"ok": True, "n": n, "factors": []}
-
     if n > 10**12:
         return {"ok": False, "error": "n_too_large_for_lite"}
 
     factors: List[int] = []
     x = n
-
     while x % 2 == 0:
         factors.append(2)
         x //= 2
-
     f = 3
-    steps = 0
-    max_steps = 5_000_000
-
     while f * f <= x:
         while x % f == 0:
             factors.append(f)
             x //= f
         f += 2
-        steps += 1
-        if steps > max_steps:
-            return {"ok": False, "error": "factorization_step_limit"}
-
     if x > 1:
         factors.append(x)
-
     return {"ok": True, "n": n, "factors": factors}
-
-def op_csv_shard(payload: Dict[str, Any]) -> Dict[str, Any]:
-    csv_text = payload.get("csv_text")
-    if csv_text is None:
-        csv_text = payload.get("text", "")
-    csv_text = str(csv_text)
-
-    b = len(csv_text.encode("utf-8", errors="ignore"))
-    if b > SAFE_MAX_BYTES:
-        return {"ok": False, "error": "csv_text_too_large_for_lite", "bytes": b, "max_bytes": SAFE_MAX_BYTES}
-
-    try:
-        shard_index = int(payload.get("shard_index", 0))
-        shard_count = int(payload.get("shard_count", 1))
-    except Exception:
-        return {"ok": False, "error": "invalid_shard_params"}
-
-    if shard_count <= 0 or shard_index < 0 or shard_index >= shard_count:
-        return {"ok": False, "error": "shard_index_out_of_range"}
-
-    has_header = bool(payload.get("has_header", True))
-
-    lines = [ln for ln in csv_text.splitlines() if ln.strip() != ""]
-    if not lines:
-        return {"ok": True, "rows": 0, "shard_rows": 0, "shard_index": shard_index, "shard_count": shard_count, "csv_text": ""}
-
-    header = lines[0] if has_header else None
-    data = lines[1:] if has_header else lines
-
-    total = len(data)
-    start = (total * shard_index) // shard_count
-    end = (total * (shard_index + 1)) // shard_count
-
-    shard_lines = data[start:end]
-    out_lines: List[str] = []
-    if header is not None:
-        out_lines.append(header)
-    out_lines.extend(shard_lines)
-
-    out = "\n".join(out_lines)
-
-    out_b = len(out.encode("utf-8", errors="ignore"))
-    if out_b > SAFE_MAX_BYTES:
-        return {"ok": False, "error": "csv_shard_output_too_large_for_lite", "bytes": out_b, "max_bytes": SAFE_MAX_BYTES}
-
-    return {
-        "ok": True,
-        "rows": total,
-        "shard_rows": len(shard_lines),
-        "shard_index": shard_index,
-        "shard_count": shard_count,
-        "start": start,
-        "end": end,
-        "csv_text": out,
-    }
 
 OPS = {
     "echo": op_echo,
     "map_tokenize": op_map_tokenize,
-    "map_classify": op_map_classify,
-    "map_route": op_map_route,
-    "csv_shard": op_csv_shard,
     "fibonacci": op_fibonacci,
     "prime_factor": op_prime_factor,
 }
 
-# =========================
-#   METRICS & GUARD
-# =========================
+_session = requests.Session()
 
 _metrics_lock = threading.Lock()
 _tasks_completed = 0
 _tasks_failed = 0
-_task_durations: List[float] = []
 
-def _record_task_result(duration_ms: float, ok: bool):
+def _metrics() -> Dict[str, Any]:
+    m: Dict[str, Any] = {}
+    if psutil:
+        try:
+            m["cpu_util"] = psutil.cpu_percent(interval=0.0) / 100.0
+        except Exception:
+            pass
+    with _metrics_lock:
+        m["tasks_completed"] = _tasks_completed
+        m["tasks_failed"] = _tasks_failed
+    return m
+
+def _inc(ok: bool) -> None:
     global _tasks_completed, _tasks_failed
     with _metrics_lock:
         if ok:
             _tasks_completed += 1
         else:
             _tasks_failed += 1
-        _task_durations.append(duration_ms)
-        if len(_task_durations) > 100:
-            _task_durations.pop(0)
-
-def _collect_metrics() -> Dict[str, Any]:
-    metrics: Dict[str, Any] = {}
-    if psutil:
-        metrics["cpu_util"] = psutil.cpu_percent(interval=0.0) / 100.0
-        try:
-            metrics["ram_mb"] = int(psutil.virtual_memory().used / 1048576)
-        except Exception:
-            pass
-    with _metrics_lock:
-        metrics["tasks_completed"] = _tasks_completed
-        metrics["tasks_failed"] = _tasks_failed
-    return metrics
 
 def system_allows_work() -> bool:
     if not psutil:
         return True
-
-    if psutil.cpu_percent(interval=0.1) >= BUSY_CPU_THRESHOLD:
-        return False
-
+    try:
+        if psutil.cpu_percent(interval=0.1) >= BUSY_CPU_THRESHOLD:
+            return False
+    except Exception:
+        pass
     if DISABLE_ON_BATTERY:
         try:
             batt = psutil.sensors_battery()
@@ -327,158 +149,120 @@ def system_allows_work() -> bool:
                 return False
         except Exception:
             pass
-
     return True
 
-# =========================
-#   NETWORKING (API PATH AUTO-DETECT)
-# =========================
-
-_session = requests.Session()
-
-def _request_json(method: str, path: str, *, json_payload=None, params=None):
-    url = f"{CONTROLLER_URL}{path}"
+def _req(method: str, path: str, *, json_payload=None, params=None) -> Optional[Dict[str, Any]]:
     try:
-        r = _session.request(method, url, json=json_payload, params=params, timeout=HTTP_TIMEOUT_SEC)
+        r = _session.request(method, f"{CONTROLLER_URL}{path}", json=json_payload, params=params, timeout=HTTP_TIMEOUT_SEC)
         if r.status_code == 204:
             return None
         r.raise_for_status()
         return r.json() if r.content else None
     except Exception as e:
-        log(f"request failed {method} {path} err={type(e).__name__}:{e}")
+        log(f"http_fail {method} {path} {type(e).__name__}:{e}")
         return None
 
-def _post_json(path: str, payload: Dict[str, Any]):
-    return _request_json("POST", path, json_payload=payload)
-
-def _get_json(path: str, params: Dict[str, Any]):
-    return _request_json("GET", path, params=params)
-
-# Prefer /api/* paths; fallback to legacy paths if needed
-PATHS = {
-    "register": ["/api/agents/register", "/agents/register"],
-    "heartbeat": ["/api/agents/heartbeat", "/agents/heartbeat"],
-    "task": ["/api/task", "/task"],
-    "result": ["/api/result", "/result", "/api/results", "/results"],
-}
-
-def _try_paths(key: str, fn, *args, **kwargs):
-    for p in PATHS[key]:
-        out = fn(p, *args, **kwargs)
-        # for GET /task, None is valid (no task), so we can't treat it as failure
-        if key == "task":
-            return out, p
-        if out is not None:
-            return out, p
-    return None, None
-
-def register_agent():
+def register_agent() -> None:
     payload = {
         "agent": AGENT_NAME,
-        "labels": BASE_LABELS,
+        "labels": LABELS,
         "capabilities": CAPABILITIES,
         "worker_profile": WORKER_PROFILE,
-        "metrics": _collect_metrics(),
+        "metrics": _metrics(),
     }
-    _, used = _try_paths("register", _post_json, payload)
-    if used:
-        log(f"registered via {used} agent={AGENT_NAME}")
+    out = _req("POST", "/api/agents/register", json_payload=payload)
+    if out is None:
+        log("register_failed /api/agents/register")
     else:
-        log("register failed on all known paths")
+        log("registered /api/agents/register")
 
-# =========================
-#   WORK LOOP
-# =========================
+def heartbeat_once() -> None:
+    payload = {
+        "agent": AGENT_NAME,
+        "labels": LABELS,
+        "capabilities": CAPABILITIES,
+        "worker_profile": WORKER_PROFILE,
+        "metrics": _metrics(),
+    }
+    out = _req("POST", "/api/agents/heartbeat", json_payload=payload)
+    if out is None:
+        log("heartbeat_failed /api/agents/heartbeat")
+
+def get_task() -> Optional[Dict[str, Any]]:
+    return _req("GET", "/api/task", params={"agent": AGENT_NAME})
+
+def post_result(task_id: Any, ok: bool, result: Optional[Dict[str, Any]], error: Optional[str], duration_ms: float) -> None:
+    payload = {
+        "id": task_id,
+        "agent": AGENT_NAME,
+        "ok": ok,
+        "result": result if ok else None,
+        "error": error if not ok else None,
+        "duration_ms": duration_ms,
+    }
+    out = _req("POST", "/api/result", json_payload=payload)
+    if out is None:
+        log(f"result_post_failed id={task_id}")
 
 _running = True
 
-def worker_loop():
+def _stop(*_a, **_k):
     global _running
+    _running = False
+    log("stop_signal")
 
+signal.signal(signal.SIGINT, _stop)
+signal.signal(signal.SIGTERM, _stop)
+
+def worker_loop() -> None:
+    global _running
     while _running:
         if not system_allows_work():
             time.sleep(0.5)
             continue
 
-        task, _ = _try_paths("task", _get_json, {"agent": AGENT_NAME})
+        task = get_task()
         if not task:
-            time.sleep(0.05)
+            time.sleep(POLL_IDLE_SEC)
+            continue
+
+        task_id = task.get("id")
+        op = task.get("op")
+        payload = task.get("payload", {}) or {}
+
+        if op not in OPS:
+            post_result(task_id, False, None, f"unknown_op:{op}", 0.0)
+            _inc(False)
             continue
 
         try:
-            op = task.get("op")
-            payload = task.get("payload", {}) or {}
-            task_id = task.get("id")
-
-            if op not in OPS:
-                _try_paths("result", _post_json, {
-                    "id": task_id,
-                    "agent": AGENT_NAME,
-                    "ok": False,
-                    "result": None,
-                    "error": f"unknown_op:{op}",
-                    "duration_ms": 0.0,
-                })
-                continue
-
             start = time.time()
             res = OPS[op](payload)
-            duration = (time.time() - start) * 1000.0
+            duration_ms = (time.time() - start) * 1000.0
             ok = bool(res.get("ok", True))
 
-            _record_task_result(duration, ok)
-            _try_paths("result", _post_json, {
-                "id": task_id,
-                "agent": AGENT_NAME,
-                "ok": ok,
-                "result": res if ok else None,
-                "error": res.get("error") if not ok else None,
-                "duration_ms": duration,
-            })
+            if ok:
+                post_result(task_id, True, res, None, duration_ms)
+            else:
+                post_result(task_id, False, None, str(res.get("error", "op_failed")), duration_ms)
+
+            _inc(ok)
         except Exception as e:
-            _record_task_result(0.0, False)
-            _try_paths("result", _post_json, {
-                "id": task.get("id"),
-                "agent": AGENT_NAME,
-                "ok": False,
-                "result": None,
-                "error": f"exception:{type(e).__name__}:{e}",
-                "duration_ms": 0.0,
-            })
+            post_result(task_id, False, None, f"exception:{type(e).__name__}:{e}", 0.0)
+            _inc(False)
 
-# =========================
-#   MAIN
-# =========================
-
-def _stop(*_args, **_kwargs):
-    global _running
-    _running = False
-    log("stop signal received")
-
-signal.signal(signal.SIGINT, _stop)
-signal.signal(signal.SIGTERM, _stop)
-
-def main():
-    log(f"starting agent name={AGENT_NAME} controller={CONTROLLER_URL}")
+def main() -> None:
+    log(f"starting name={AGENT_NAME} controller={CONTROLLER_URL}")
     register_agent()
 
-    def _hb_loop():
+    def hb_loop():
         while _running:
-            payload = {
-                "agent": AGENT_NAME,
-                "labels": BASE_LABELS,
-                "capabilities": CAPABILITIES,
-                "worker_profile": WORKER_PROFILE,
-                "metrics": _collect_metrics(),
-            }
-            _, used = _try_paths("heartbeat", _post_json, payload)
-            if not used:
-                log("heartbeat failed on all known paths")
+            heartbeat_once()
             time.sleep(HEARTBEAT_SEC)
 
-    threading.Thread(target=_hb_loop, daemon=True).start()
+    threading.Thread(target=hb_loop, daemon=True).start()
     worker_loop()
-    log("agent exiting")
+    log("exiting")
 
 if __name__ == "__main__":
     main()
