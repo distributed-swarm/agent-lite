@@ -5,6 +5,7 @@ import signal
 import threading
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from ops import csv_shard
 
 import requests
 
@@ -106,6 +107,7 @@ OPS = {
     "map_tokenize": op_map_tokenize,
     "fibonacci": op_fibonacci,
     "prime_factor": op_prime_factor,
+    "read_csv_shard": csv_shard.op_read_csv_shard
 }
 
 _session = requests.Session()
