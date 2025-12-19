@@ -1,31 +1,25 @@
-# Agent-Lite Installation (Windows)
+# Agent-Lite (Windows) — Headless Service
 
-Agent-Lite is a lightweight CPU-only worker that runs quietly in the background and connects to a Neuro-Fabric controller.
-
----
-
-## Quick Install
-
-1. Right-click `install.bat`
-2. Select **Run as administrator**
-3. When prompted, enter your **Controller URL**
-   - Example: `http://controller:8080`
-4. Installation completes automatically.
-5. Agent-Lite starts immediately as a Windows service.
-
----
+Agent-Lite runs as a Windows Service. There is no UI and no user interaction.
+Install and management are intended for administrators only.
 
 ## Requirements
+- Windows 10/11
+- Python 3.8+ (3.11 recommended)
+- Administrator rights
 
-- Windows 10 or Windows 11
-- Python 3.8+ (Python 3.11 recommended)
-- Administrator privileges
+## Configuration
+Agent-Lite reads configuration from:
 
----
+- `%ProgramData%\AgentLite\agent.env`
 
-## Verify Installation
+Installer behavior:
+- If `%ProgramData%\AgentLite\agent.env` does not exist, `install.bat` will copy `agent.env.template` from the install folder.
+- If neither exists, install fails (no prompts).
 
-Open **Command Prompt (Admin)** and run:
+## Install (Admin)
+Right-click `install.bat` → **Run as administrator**
 
+## Verify
 ```bat
 sc query AgentLite
