@@ -1,12 +1,3 @@
-"""
-Agent-Lite Windows Service wrapper (headless, admin-managed)
-
-- Runs app.main() as a Windows service
-- No UI, no user interaction
-- Loads config from %ProgramData%\\AgentLite\\agent.env (preferred)
-- Logs to %ProgramData%\\AgentLite\\service.log
-"""
-
 import os
 import sys
 import time
@@ -19,26 +10,13 @@ import win32service
 import win32event
 import servicemanager
 
-
-# =========================
-#   PATHS / CONFIG
-# =========================
-
 SERVICE_NAME = "AgentLite"
 
 PROGRAM_DATA_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "AgentLite"
 PROGRAM_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_FILE = PROGRAM_DATA_DIR / "service.log"
-ENV_FILE_PRIMARY = PROGRAM_DATA_DIR / "agent.env"
-
-# Optional dev fallback (not required for prod)
-ENV_FILE_FALLBACK = Path.home() / "AppData" / "Local" / "AgentLite" / "agent.env"
-
-
-# =========================
-#   LOGGING
-# =========================
+ENV_FILE = PROGRAM_DATA_DIR / "agent.env"
 
 logging.basicConfig(
     filename=str(LOG_FILE),
@@ -48,15 +26,12 @@ logging.basicConfig(
 logger = logging.getLogger("AgentLiteService")
 
 
-def _load_env_file(path: Path) -> bool:
-    """
-    Load simple KEY=VALUE pairs into os.environ, without overriding existing keys.
-    Returns True if loaded.
-    """
+def load_env_file(path: Path) -> None:
+    """Load KEY=VALUE pairs into os.environ (does not override existing env)."""
+    if not path.exists():
+        logger.error("Missing env file: %s", str(path))
+        return
     try:
-        if not path.exists():
-            return False
-
         for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -66,26 +41,10 @@ def _load_env_file(path: Path) -> bool:
             v = v.strip().strip('"').strip("'")
             if k and k not in os.environ:
                 os.environ[k] = v
-
         logger.info("Loaded env from: %s", str(path))
-        return True
     except Exception:
         logger.exception("Failed to load env file: %s", str(path))
-        return False
 
-
-def load_configuration():
-    """
-    Load config from ProgramData env file first, then optional fallback.
-    """
-    loaded = _load_env_file(ENV_FILE_PRIMARY)
-    if not loaded:
-        _load_env_file(ENV_FILE_FALLBACK)
-
-
-# =========================
-#   SERVICE CLASS
-# =========================
 
 class AgentLiteService(win32serviceutil.ServiceFramework):
     _svc_name_ = SERVICE_NAME
@@ -101,7 +60,6 @@ class AgentLiteService(win32serviceutil.ServiceFramework):
     def SvcStop(self):
         logger.info("Service stop requested")
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
-
         self.is_running = False
         win32event.SetEvent(self.stop_event)
 
@@ -126,57 +84,43 @@ class AgentLiteService(win32serviceutil.ServiceFramework):
         self.main()
 
     def main(self):
-        """
-        Runs app.main() inside a managed loop. If the agent crashes, restart it with backoff.
-        """
         script_dir = Path(__file__).parent.resolve()
 
         try:
-            # Ensure predictable runtime behavior
-            load_configuration()
+            # Load admin-managed config
+            load_env_file(ENV_FILE)
 
-            # Ensure imports and relative file access work
+            # Make service runtime deterministic
             os.chdir(script_dir)
             if str(script_dir) not in sys.path:
                 sys.path.insert(0, str(script_dir))
 
-            logger.info("Working directory set to: %s", str(script_dir))
-            logger.info("Python executable: %s", sys.executable)
+            logger.info("Working directory: %s", str(script_dir))
+            logger.info("Python: %s", sys.executable)
 
-            # Import agent module after env is loaded
-            import app  # noqa
+            import app  # must exist next to Service.py
 
-            # Optional sanity log (won’t crash if not present)
-            controller_url = getattr(app, "CONTROLLER_URL", os.environ.get("CONTROLLER_URL", ""))
-            agent_name = getattr(app, "AGENT_NAME", os.environ.get("AGENT_NAME", ""))
-            logger.info("Controller URL: %s", controller_url)
-            logger.info("Agent Name: %s", agent_name)
+            logger.info("Controller URL: %s", getattr(app, "CONTROLLER_URL", ""))
+            logger.info("Agent Name: %s", getattr(app, "AGENT_NAME", ""))
 
-            # Managed run loop
             crash_count = 0
             backoff_s = 2
 
-            def run_agent_once():
-                # app.main() is expected to block until stopped
-                app.main()
-
             while self.is_running:
-                # Start agent thread
                 exc_holder = {"exc": None}
 
-                def thread_target():
+                def run_agent():
                     try:
-                        logger.info("Starting agent worker...")
-                        run_agent_once()
-                        logger.info("Agent worker exited normally")
+                        logger.info("Starting app.main()")
+                        app.main()
+                        logger.info("app.main() exited normally")
                     except Exception as e:
                         exc_holder["exc"] = e
                         logger.exception("Agent crashed")
 
-                self.agent_thread = threading.Thread(target=thread_target, daemon=False)
+                self.agent_thread = threading.Thread(target=run_agent, daemon=False)
                 self.agent_thread.start()
 
-                # Monitor stop event / agent health
                 while self.is_running:
                     rc = win32event.WaitForSingleObject(self.stop_event, 3000)
                     if rc == win32event.WAIT_OBJECT_0:
@@ -185,7 +129,6 @@ class AgentLiteService(win32serviceutil.ServiceFramework):
                     if self.agent_thread and not self.agent_thread.is_alive():
                         break
 
-                # Request stop inside app if service is stopping
                 if not self.is_running:
                     try:
                         if hasattr(app, "_running"):
@@ -194,36 +137,23 @@ class AgentLiteService(win32serviceutil.ServiceFramework):
                         logger.exception("Failed to signal agent stop")
                     break
 
-                # If thread ended unexpectedly, restart with backoff
                 if self.agent_thread and not self.agent_thread.is_alive():
                     crash_count += 1
-                    e = exc_holder["exc"]
-                    logger.error("Agent stopped unexpectedly (crash_count=%d, err=%s)", crash_count, repr(e))
-
-                    # backoff up to 60s
+                    logger.error("Agent stopped unexpectedly (crash_count=%d, err=%r)", crash_count, exc_holder["exc"])
                     time.sleep(backoff_s)
                     backoff_s = min(backoff_s * 2, 60)
                     continue
 
-            # Final cleanup
             logger.info("Service main loop exiting")
 
-        except ImportError:
-            logger.exception("Failed to import app.py. Ensure app.py is in the same folder as Service.py.")
         except Exception:
             logger.exception("Fatal error in service")
 
 
-# =========================
-#   CLI ENTRYPOINT
-# =========================
-
 if __name__ == "__main__":
     if len(sys.argv) == 1:
-        # Started by Windows Service Manager
         servicemanager.Initialize()
         servicemanager.PrepareToHostSingle(AgentLiteService)
         servicemanager.StartServiceCtrlDispatcher()
     else:
-        # Normal CLI management (admin)
         win32serviceutil.HandleCommandLine(AgentLiteService)
